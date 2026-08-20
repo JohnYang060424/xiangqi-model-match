@@ -22,12 +22,15 @@ arena.py — 中国象棋 AI 自动对战 runner（三局两胜 / 任意 BO_N �
 用法
 ----
   # 初始化（两模型自动对战）。选手格式:
-  #   openai|<base_url>|<api_key>|<model>[|<timeout秒>]
-  #   ollama|<base_url>|<api_key>|<model>[|<timeout秒>]   # Ollama /api/chat（如 a3b）
+  #   openai|<base_url>|<api_key>|<model>[|<timeout秒>][|<think>]
+  #   ollama|<base_url>|<api_key>|<model>[|<timeout秒>][|<think>]   # Ollama /api/chat（如 a3b）
   #   stdio
   # timeout 可选，适配低速模型（默认 openai=600s / ollama=300s）。
-  python arena.py init --red "ollama|http://127.0.0.1:11435|api-key|qwen3:30b-a3b|300" \
-                       --black "openai|http://127.0.0.1:8000/v1|sk-local|qwen3.8-27b|600" \
+  # think 可选（on/off）：是否让模型带思考链下棋。默认 openai=on（大模型棋力依赖
+  # 思考链，max_tokens=4096 即为容纳思考而设）、ollama=off（原生 think 开关，速度快）。
+  # 注意：vLLM 严格执行 enable_thinking，transformers 后端则忽略该参数——详见 README。
+  python arena.py init --red "ollama|http://127.0.0.1:11435|api-key|qwen3:30b-a3b|300|off" \
+                       --black "openai|http://127.0.0.1:8000/v1|sk-local|qwen3.8-27b|600|on" \
                        --best-of 3 --match-id "a3b-vs-27B"
 
   # 全自动跑完（含 stdio 选手时会自动退化为逐步模式）
@@ -38,12 +41,17 @@ arena.py — 中国象棋 AI 自动对战 runner（三局两胜 / 任意 BO_N �
 
   # 查看当前局面
   python arena.py status
+
+  # 查看版本
+  python arena.py version
 """
 import sys, os, json, re, time, random, urllib.request, urllib.error
 
 # 让脚本无论从哪个目录运行都能 import 同目录的 referee
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import referee as R
+
+__version__ = '1.1.0'
 
 STATE = 'match_state.json'
 LOG = 'arena_log.md'
@@ -56,10 +64,13 @@ NATURAL_LIMIT = 120      # 连续无吃子手数（自然限着）-> 和棋
 def parse_player_spec(spec):
     """选手格式（用 | 分隔，避免与 URL 中的 : 冲突）：
       stdio
-      openai|<base>|<key>|<model>[|<timeout>]
-      ollama|<base>|<key>|<model>[|<timeout>]
+      openai|<base>|<key>|<model>[|<timeout>][|<think>]
+      ollama|<base>|<key>|<model>[|<timeout>][|<think>]
     timeout（秒）为单步模型调用超时，用于适配低速模型（如 27B 单步可达数百秒）。
     未显式给出时按类型取默认：openai=600，ollama=300。
+    think（on/off）为是否带思考链下棋：默认 openai=on、ollama=off。
+    背景：vLLM 后端严格执行 enable_thinking（关掉会显著削弱大模型棋力），
+    transformers 后端则忽略该参数；Ollama 原生 think 开关默认关闭以提速。
     """
     if spec == 'stdio' or spec.startswith('stdio'):
         return {'type': 'stdio'}
@@ -71,7 +82,15 @@ def parse_player_spec(spec):
     key = parts[2] if len(parts) > 2 else ''
     model = parts[3] if len(parts) > 3 else ''
     timeout = float(parts[4]) if len(parts) > 4 and parts[4] else 0.0
-    p = {'type': ptype, 'base': base, 'key': key, 'model': model}
+    # 第 6 段可选 think 开关：on/true/1/yes -> True，off/false/0/no -> False
+    think_raw = parts[5].strip().lower() if len(parts) > 5 and parts[5].strip() else ''
+    if think_raw in ('on', 'true', '1', 'yes'):
+        think = True
+    elif think_raw in ('off', 'false', '0', 'no'):
+        think = False
+    else:
+        think = (ptype == 'openai')   # 默认：openai 开思考（棋力依赖），ollama 关思考（提速）
+    p = {'type': ptype, 'base': base, 'key': key, 'model': model, 'think': think}
     if ptype == 'openai':
         p['timeout'] = timeout if timeout else 600.0
     else:  # ollama
@@ -84,17 +103,20 @@ def call_openai(p, prompt, timeout=300):
     # 不发 system 消息：部分推理服务（如本仓库实测的 Qwen3.8 服务端）只在「无 system」
     # 时注入「直接简洁、不要思考」的压制 system；若我们自带 system 反而阻断它，
     # 模型会自由长思考拖慢对战。所有走子指令已包含在 user 提示里。
+    # 思考模式：vLLM 会严格执行 enable_thinking；transformers 后端则忽略此参数。
+    # 27B 实测：关思考后棋力骤降（红黑坐标混淆/来回穿梭成和），开思考则正常攻防；
+    # max_tokens=4096 即为容纳思考链而设（预算太小会被截断在思考中途导致解析失败）。
+    # 故 openai 选手默认 think=on；关闭思考时输出预算降回 1024（无思考链无需 4096）。
+    think = p.get('think', True)
     data = {
         "model": p['model'],
         "messages": [
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.3,
-        # 留足输出预算：部分服务端会忽略 enable_thinking，模型先输出 <think> 长链
-        # 再在末尾给坐标；预算太小会被截断在思考中途导致解析失败。
-        "max_tokens": 1024,
+        "max_tokens": 4096 if think else 1024,
         "stream": False,
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": think},
     }
     headers = {"Content-Type": "application/json"}
     if p.get('key'):
@@ -126,7 +148,8 @@ SYS_PROMPT = (
 
 def call_ollama(p, prompt, timeout=300):
     """调用 Ollama /api/chat（如 a3b=qwen3:30b-a3b）。
-    Ollama 原生支持 system 消息，且 think:False 可关闭长链思考以提速；超时按低速模型配置。
+    Ollama 原生支持 system 消息与 think 开关（默认关思考以提速，
+    可在选手格式第 6 段给 on 打开）；超时按低速模型配置。
     """
     data = {
         "model": p['model'],
@@ -135,7 +158,7 @@ def call_ollama(p, prompt, timeout=300):
             {"role": "user", "content": prompt},
         ],
         "stream": False,
-        "think": False,
+        "think": bool(p.get('think', False)),
         "options": {"num_ctx": p.get('num_ctx', 4096), "temperature": 0.3},
     }
     headers = {"Content-Type": "application/json"}
@@ -362,6 +385,8 @@ def play_one_move(st, forced_move=None):
     nb[sy][sx] = R.EMPTY
 
     cur['ply'] += 1
+    # 走子成功：清零该方犯规计数（语义为"连续"犯规判负，而非累计）
+    cur['faults'][pidx] = 0
     cur['history'].append({
         'num': cur['ply'], 'side': me, 'move': mv,
         'piece': piece, 'capture': captured,
@@ -603,7 +628,10 @@ def main():
         print(__doc__)
         return 2
     cmd = sys.argv[1]
-    if cmd == 'init':
+    if cmd == 'version':
+        print('xiangqi-model-match v' + __version__)
+        return 0
+    elif cmd == 'init':
         return cmd_init(sys.argv[2:])
     elif cmd == 'status':
         cmd_status()
