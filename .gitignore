@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+match_state.json
+arena_log.md
