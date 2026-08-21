@@ -1,6 +1,6 @@
 # Xiangqi Model Match — AI 象棋自动对战框架
 
-> 当前版本 **v1.1.0**（变更记录见 [CHANGELOG.md](CHANGELOG.md)）
+> 当前版本 **v1.1.1**（变更记录见 [CHANGELOG.md](CHANGELOG.md)）
 
 让两个 LLM 在一台机器上**全自动**下中国象棋，由**机械规则引擎**逐手校验，绝无人工裁决、绝无 LLM 互信。纯标准库，零第三方依赖。
 
@@ -12,8 +12,10 @@
 - **机械裁判**：每步过 `referee.py` 规则引擎，非法走子回灌完整合法着法列表让模型纠正
 - **自动终局**：将死 / 困毙 / 三次重复 / 自然限着（120 手无吃子）/ 子力不足 / 认输 / 犯规判负
 - **系列赛**：支持 BO_N 赛制（三局两胜等），每局交换先后手，先达 `ceil(N/2)` 局夺冠
-- **断点续跑**：状态落 `match_state.json`，日志落 `arena_log.md`
+- **断点续跑**：状态落 `match_state.json`，日志落 `arena_log.md`（比分表每局自动刷新）
+- **比赛级时限**：`run --max-hours H` 整体墙钟上限，超时即停、可续跑
 - **内部重试**：模型调用 3 次内部重试吸收瞬时抖动，全部失败才按犯规处理
+- **测试套件**：`tests/` 规则引擎与走法解析回归测试（`python -m unittest discover tests`）
 
 ## 快速开始
 
@@ -78,7 +80,7 @@ python scripts/arena.py step h2-e2         # 提交走法，自动走对方一�
 | 命令 | 说明 |
 |---|---|
 | `arena.py init --red <spec> --black <spec> [--best-of 3] [--match-id "..."]` | 初始化系列赛，抛硬币决定 G1 先后手 |
-| `arena.py run [--max-plies N]` | 全自动跑（含 stdio 选手时退化为逐步并提示） |
+| `arena.py run [--max-plies N] [--max-hours H]` | 全自动跑（含 stdio 选手时退化为逐步并提示）；`--max-plies` 单局手数上限，`--max-hours` 整个系列赛墙钟上限（小时，超时即停、重跑续跑） |
 | `arena.py step [<from>-<to>]` | 逐步：不给走法则打印局面，给了则落子并自动走对方一手 |
 | `arena.py status` | 查看当前局面与比分 |
 | `arena.py version` | 查看框架版本 |
@@ -100,6 +102,7 @@ python scripts/arena.py step h2-e2         # 提交走法，自动走对方一�
 | 子力不足 | 双方均无攻击子力（车马炮兵卒）→ 和 |
 | 认输 | 模型输出 `RESIGN` / `认输` / `投降` → 负 |
 | 犯规判负 | 单局连续 3 次非法走子（含空输出）→ 负 |
+| 长将/长捉（连续将军） | ⚠️ **未实现**——机械裁判不判定"连续将军判负"（已知限制，见 [CHANGELOG](CHANGELOG.md)）；如对局出现可人工按规则裁决 |
 
 ## 架构
 
@@ -124,8 +127,10 @@ python scripts/arena.py step h2-e2         # 提交走法，自动走对方一�
 
 | 文件 | 说明 |
 |---|---|
-| `scripts/arena.py` | 自动对战 runner（openai/ollama/stdio 选手、BO_N 赛制、思考模式开关、犯规判负、断点续跑，纯标准库） |
+| `scripts/arena.py` | 自动对战 runner（openai/ollama/stdio 选手、BO_N 赛制、思考模式开关、比赛级时限、犯规判负、断点续跑、比分表自动刷新，纯标准库） |
 | `scripts/referee.py` | 中国象棋规则引擎（走法生成 / 合法性 / 将军 / 将死 / 困毙 / 和棋 / FEN / ASCII 棋盘，纯标准库 ~500 行） |
+| `tests/test_referee.py` | 规则引擎回归测试（蹩马腿 / 塞象眼 / 炮架 / 将死 / 困毙 / 对脸等 18 例） |
+| `tests/test_arena.py` | 走法解析回归测试（思考标签泛化 / 认输检测等 9 例） |
 | `CHANGELOG.md` | 版本变更记录 |
 
 ## 依赖

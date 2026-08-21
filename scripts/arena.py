@@ -34,7 +34,9 @@ arena.py — 中国象棋 AI 自动对战 runner（三局两胜 / 任意 BO_N �
                        --best-of 3 --match-id "a3b-vs-27B"
 
   # 全自动跑完（含 stdio 选手时会自动退化为逐步模式）
-  python arena.py run [--max-plies N]
+  # --max-plies N  单局手数上限（每局独立计数）
+  # --max-hours H  整个系列赛墙钟上限（小时，超时即停，可续跑）
+  python arena.py run [--max-plies N] [--max-hours H]
 
   # 逐步模式（任一选手为 stdio 时）：每条命令推进「我方一手 + 对方一手」
   python arena.py step [<from>-<to>]     # 不给 move 时打印当前局面，等你输入
@@ -51,7 +53,7 @@ import sys, os, json, re, time, random, urllib.request, urllib.error
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import referee as R
 
-__version__ = '1.1.0'
+__version__ = '1.1.1'
 
 STATE = 'match_state.json'
 LOG = 'arena_log.md'
@@ -185,16 +187,26 @@ def call_ollama(p, prompt, timeout=300):
 # 走子解析与提示构造
 # ---------------------------------------------------------------------------
 def parse_move(text):
-    """从模型原始输出里抽取 from-to 坐标（兼容思考标签与棋子字母前缀）。"""
-    if '</think:6124c78e>' in text:
-        text = text.split('</think:6124c78e>')[-1]
-    ms = re.findall(r'[A-Za-z]?([a-i][0-9]-[a-i][0-9])', text)
-    return ms[-1] if ms else None
+    """从模型原始输出里抽取 from-to 坐标（兼容各类思考标签与棋子字母前缀）。
+
+    思考标签不做硬编码：按常见推理闭合标签（</think>、</reasoning>、</output>
+    及 Qwen 服务端的 </think:xxxx> 变体）切段，**从后向前**找第一个含坐标的段——
+    兼顾两类形态：① 答案在闭合标签之后（Qwen/标准 think）；② 答案包在
+    <output>…</output> 内、闭合标签在末尾。旧实现只认 </think:6124c78e>
+    这一个特定字符串且只取其后内容，换模型即失效或取到思考链里的坐标。
+    无任何闭合标签（如思考被截断）时退化为整段取最后一个坐标。
+    """
+    parts = re.split(r'</(?:think(?::[0-9a-f]+)?|reasoning|output)>', text, flags=re.IGNORECASE)
+    for seg in reversed(parts):
+        ms = re.findall(r'[A-Za-z]?([a-i][0-9]-[a-i][0-9])', seg)
+        if ms:
+            return ms[-1]
+    return None
 
 
 def detect_resign(text):
     t = text.lower()
-    return ('resign' in t) or ('认输' in text) or ('投降' in text) or ('我认输' in text)
+    return ('resign' in t) or ('认输' in text) or ('投降' in text)
 
 
 def build_prompt(board, side, n, retry=None):
@@ -454,17 +466,23 @@ def _record_game_result(st, stt, detail):
         winner_name = '和棋'
     st['games'].append({
         'no': cur['game_no'], 'red': red_name, 'black': black_name,
+        'red_idx': cur['red_idx'], 'black_idx': cur['black_idx'],
         'result': stt, 'reason': detail, 'winner': winner_name,
         'plies': cur['ply'],
     })
 
 
 def _after_game(st):
+    # 每局结束先重建日志头部：比分表/总比分跟随 score 与 games 刷新
+    # （旧实现从不刷新，比分永远停在 0:0）。
+    refresh_log_header(st)
     target = (st['best_of'] // 2) + 1
     if st['score']['r'] >= target or st['score']['b'] >= target or \
        (len(st['games']) >= st['best_of']):
         return ('match_over', {'score': st['score'], 'games': st['games']})
-    # 开下一局：换先（G1 抛硬币；之后交替；如需 G3 再抛）
+    # 开下一局：G1 抛硬币；G2 与 G1 换先；G3（如有）重抛。
+    # red_idx 已在 games 记录里显式存储，G2 换先直接读它取反——
+    # 旧实现 .get('red_idx') 永远走 default 分支、靠 current 尚未被覆盖的时序碰巧正确，极脆弱。
     next_no = len(st['games']) + 1
     if next_no == 2:
         red_idx = 1 - st['games'][0].get('red_idx', st['current']['red_idx'])
@@ -491,25 +509,45 @@ def _append_log_move(st, me, mv, piece, captured, stt=None, detail=None):
         f.write(line + '\n')
 
 
+def _write_log_head(f, st):
+    """写日志头部（赛制/选手/比分表/总比分）。init 与 refresh 共用，保证格式一致。"""
+    f.write(f"# 🤖♟️ 自动对战日志 · {st['match_id']}\n\n")
+    f.write(f"- 赛制：{st['best_of']} 局制（先胜 {st['best_of'] // 2 + 1} 局夺冠）\n")
+    f.write(f"- 红方选手：{st['players'][0]['name']} / 黑方选手：{st['players'][1]['name']}\n")
+    f.write(f"- 开始：{st.get('start') or time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+    f.write("## 📊 比分\n\n")
+    f.write("| 局次 | 红方 | 黑方 | 结果 |\n|---|---|---|---|\n")
+    for g in st['games']:
+        f.write(f"| G{g['no']} | {g['red']} | {g['black']} | {g['winner']} ({g['result']}) |\n")
+    f.write(f"\n**总比分：红 {st['score']['r']} - {st['score']['b']} 黑**\n\n")
+
+
 def init_log(st):
     with open(LOG, 'w', encoding='utf-8') as f:
-        f.write(f"# 🤖♟️ 自动对战日志 · {st['match_id']}\n\n")
-        f.write(f"- 赛制：三局两胜（先胜 {st['best_of'] // 2 + 1} 局夺冠）\n")
-        f.write(f"- 红方选手：{st['players'][0]['name']} / 黑方选手：{st['players'][1]['name']}\n")
-        f.write(f"- 开始：{time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-        f.write("## 📊 比分\n\n")
-        f.write("| 局次 | 红方 | 黑方 | 结果 |\n|---|---|---|---|\n")
-        for g in st['games']:
-            f.write(f"| G{g['no']} | {g['red']} | {g['black']} | {g['winner']} ({g['result']}) |\n")
-        f.write(f"\n**总比分：红 {st['score']['r']} - {st['score']['b']} 黑**\n\n")
+        _write_log_head(f, st)
         f.write("## 📜 走子记录\n\n")
         f.write("| 局 | 执方 | 走子 | 校验 | 备注 |\n|---|---|---|---|---|\n")
 
 
 def refresh_log_header(st):
-    """每局结束后刷新比分表（简单重写头部）。"""
-    # 头部已在 init_log 写死，这里只追加终局小结即可，避免复杂重写。
-    pass
+    """每局结束后重建日志头部（比分表/总比分），保留全部走子记录。
+
+    旧实现 init_log 把头部写死后从不刷新，比分表永远停在 0:0（v1.0 遗留 bug）。
+    这里读出「## 📜 走子记录」之后的内容原样保留，仅重写其上的头部。
+    """
+    moves = ''
+    try:
+        with open(LOG, encoding='utf-8') as f:
+            content = f.read()
+        marker = '## 📜 走子记录'
+        if marker in content:
+            moves = content.split(marker, 1)[1]
+    except FileNotFoundError:
+        pass
+    with open(LOG, 'w', encoding='utf-8') as f:
+        _write_log_head(f, st)
+        f.write('## 📜 走子记录')
+        f.write(moves)
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +582,8 @@ def cmd_init(args):
         'match_id': match_id, 'best_of': best_of,
         'score': {'r': 0, 'b': 0}, 'games': [],
         'players': [pr, pb], 'current': None,
+        'start': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'start_ts': time.time(),   # 系列赛墙钟起点，供 run --max-hours 计时
     }
     red_idx = random.randint(0, 1)
     new_game(st, 1, red_idx)
@@ -597,15 +637,32 @@ def cmd_step(args):
 
 
 def cmd_run(args):
-    """全自动跑（含 stdio 时退化为逐步：遇到 need_input 即停并提示）。"""
+    """全自动跑（含 stdio 时退化为逐步：遇到 need_input 即停并提示）。
+    --max-plies N  单局手数上限；--max-hours H  整个系列赛墙钟上限（小时）。
+    两者都是「软停止」：状态正常落盘，可随时重跑 arena.py run 续跑。
+    """
     max_plies = None
-    for i, a in enumerate(args):
+    max_hours = None
+    i = 0
+    while i < len(args):
+        a = args[i]
         if a == '--max-plies':
-            max_plies = int(args[i + 1])
+            max_plies = int(args[i + 1]); i += 2
+        elif a == '--max-hours':
+            max_hours = float(args[i + 1]); i += 2
+        else:
+            i += 1
     st = load_state()
+    start_ts = st.get('start_ts') or time.time()
     while True:
         if max_plies is not None and st['current']['ply'] >= max_plies:
             print(f"已达 --max-plies {max_plies}，停止。")
+            break
+        if max_hours is not None and (time.time() - start_ts) / 3600.0 >= max_hours:
+            print(f"已达 --max-hours {max_hours}h，停止。"
+                  f"当前 G{st['current']['game_no']} 第{st['current']['ply']}手，"
+                  f"比分 红 {st['score']['r']} - {st['score']['b']} 黑。"
+                  f"（重跑 arena.py run 可继续）")
             break
         status, info = play_one_move(st)
         if status == 'need_input':
