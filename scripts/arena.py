@@ -53,10 +53,11 @@ import sys, os, json, re, time, random, urllib.request, urllib.error
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import referee as R
 
-__version__ = '1.1.1'
+__version__ = '1.1.2'
 
 STATE = 'match_state.json'
 LOG = 'arena_log.md'
+REPLAY = 'replay.jsonl'  # 结构化复盘记录：每步模型原始输出/解析/校验，逐行 JSON
 FAULT_LIMIT = 3          # 单局连续犯规上限，达到即判负
 NATURAL_LIMIT = 120      # 连续无吃子手数（自然限着）-> 和棋
 
@@ -331,27 +332,50 @@ def play_one_move(st, forced_move=None):
         raw = None
         for attempt in range(FAULT_LIMIT):
             prompt = build_prompt(board, side, n, retry)
+            t0 = time.time()
             try:
                 if player['type'] == 'ollama':
                     raw = call_ollama(player, prompt, player.get('timeout', 300))
                 else:
                     raw = call_openai(player, prompt, player.get('timeout', 600))
+                api_sec = round(time.time() - t0, 1)
             except Exception as e:
                 raw = ''
+                api_sec = round(time.time() - t0, 1)
                 reason = f'调用模型异常: {e}'
             else:
                 reason = None
+            # 复盘记录：每步每次尝试的原始输出 + 裁判结论（含异常）
+            repl = {
+                'ts': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'game': cur['game_no'], 'ply': n, 'side': me,
+                'model': player.get('model') or player.get('name'),
+                'attempt': attempt + 1, 'api_sec': api_sec,
+                'raw': (raw or '')[:4000], 'prompt': prompt[:1500],
+            }
+            if reason:
+                repl['error'] = reason[:500]
+                _append_replay(repl)
             if detect_resign(raw or ''):
                 mv = '__RESIGN__'
+                repl['resign'] = True
+                _append_replay(repl)
                 break
             mv = parse_move(raw or '')
             if mv is None:
                 reason = '未解析到 from-to 坐标'
+                repl['invalid'] = reason
+                _append_replay(repl)
             else:
                 ok, _, msg = R.apply_move(board, mv)
+                repl['move'] = mv
                 if ok:
+                    repl['valid'] = True
+                    _append_replay(repl)
                     break
                 reason = msg
+                repl['invalid'] = reason
+                _append_replay(repl)
             # 非法 -> 累计犯规，回灌合法着法重试
             cur['faults'][pidx] += 1
             if cur['faults'][pidx] >= FAULT_LIMIT:
@@ -509,6 +533,14 @@ def _append_log_move(st, me, mv, piece, captured, stt=None, detail=None):
         f.write(line + '\n')
 
 
+def _append_replay(rec):
+    """追加一条结构化复盘记录（JSONL）。包含模型原始输出与裁判校验结果，
+    供赛后逐手复盘 LLM 的棋力与失误（基础版 xiangqi-arena 有此能力，v1.1.1 补齐）。
+    """
+    with open(REPLAY, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(rec, ensure_ascii=False, default=str) + '\n')
+
+
 def _write_log_head(f, st):
     """写日志头部（赛制/选手/比分表/总比分）。init 与 refresh 共用，保证格式一致。"""
     f.write(f"# 🤖♟️ 自动对战日志 · {st['match_id']}\n\n")
@@ -527,6 +559,9 @@ def init_log(st):
         _write_log_head(f, st)
         f.write("## 📜 走子记录\n\n")
         f.write("| 局 | 执方 | 走子 | 校验 | 备注 |\n|---|---|---|---|---|\n")
+    # 清空旧的复盘记录，保证 replay.jsonl 与本次系列赛对齐
+    with open(REPLAY, 'w', encoding='utf-8'):
+        pass
 
 
 def refresh_log_header(st):

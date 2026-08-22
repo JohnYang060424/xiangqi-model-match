@@ -123,12 +123,24 @@ python scripts/arena.py step h2-e2         # 提交走法，自动走对方一�
 
 `arena.py` 是 runner：初始化系列赛 → 循环推进每手 → 调用 `referee.py` 校验合法性 → 合法则落子记录、非法则回灌合法着法列表让模型纠正 → 判定终局 → 记比分 → 开下一局或结束。
 
+## 输出
+
+| 文件 | 内容 |
+|---|---|
+| `arena_log.md` | 人类可读全过程：比分表 + 每步走子与裁判事件（含驳回/重试） |
+| `match_state.json` | 机器状态：比分、每局历史、FEN、犯规计数（断点续跑依据） |
+| `replay.jsonl` | **结构化复盘**：每步每次模型调用的原始输出（含思考链）、API 耗时、提取走法、裁判校验结论，逐行 JSON——适合脚本分析"模型哪里走错" |
+
+全程自动记录模型的**对与错**：哪个模型走错了、裁判怎么驳回的、重试了几次，
+都在日志与复盘文件里，适合复盘 LLM 的下棋能力。
+
 ## 文件
 
 | 文件 | 说明 |
 |---|---|
-| `scripts/arena.py` | 自动对战 runner（openai/ollama/stdio 选手、BO_N 赛制、思考模式开关、比赛级时限、犯规判负、断点续跑、比分表自动刷新，纯标准库） |
-| `scripts/referee.py` | 中国象棋规则引擎（走法生成 / 合法性 / 将军 / 将死 / 困毙 / 和棋 / FEN / ASCII 棋盘，纯标准库 ~500 行） |
+| `scripts/arena.py` | 自动对战 runner（openai/ollama/stdio 选手、BO_N 赛制、犯规判负、断点续跑、复盘记录，纯标准库） |
+| `scripts/referee.py` | 中国象棋规则引擎（走法生成 / 合法性 / 将军 / 将死 / 困毙 / 和棋 / FEN / ASCII 棋盘，纯标准库） |
+| `tests/` | 机械裁判与 runner 的单元测试（unittest，零依赖） |
 | `tests/test_referee.py` | 规则引擎回归测试（蹩马腿 / 塞象眼 / 炮架 / 将死 / 困毙 / 对脸等 18 例） |
 | `tests/test_arena.py` | 走法解析回归测试（思考标签泛化 / 认输检测等 9 例） |
 | `CHANGELOG.md` | 版本变更记录 |
